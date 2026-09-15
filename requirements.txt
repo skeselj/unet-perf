@@ -1,0 +1,16 @@
+# Direct dependencies.
+
+--extra-index-url https://download.pytorch.org/whl/cu126
+torch==2.14.0+cu126
+torchvision==0.29.0+cu126
+
+opencv-python==5.0.0.93
+numpy==2.4.6
+
+psutil==7.2.2
+nvidia-ml-py==13.610.43
+
+matplotlib==3.11.1
+tensorboard==2.21.0
+ipykernel==7.3.0
+jupyterlab==4.6.3
