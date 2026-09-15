@@ -1,9 +1,6 @@
-"""
-Module to support sharing constants across modules.
-"""
-
 DEFAULT_SEED = 20260912
 
 IMAGE_CHANNEL_COUNT = 3
+
 MIN_PIXEL_INT_VALUE = 0
 MAX_PIXEL_INT_VALUE = 255

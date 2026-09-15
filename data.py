@@ -1,10 +1,12 @@
 """
-Module to support accessing semantic segmentation datasets.
+Module to support accessing semantic segmentation data.
 """
 
 import hashlib
 import logging
 import os
+import queue
+import threading
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 
@@ -15,35 +17,75 @@ from constants import DEFAULT_SEED
 
 logger = logging.getLogger(__name__)
 
-# Iterator over (images, masks) batches.
+# Iterator over datapoint sets: (image_batch, mask_batch).
+#   image_batch: (B, H, W, 3) shaped uint8 values.
+#   mask_batch: (B, H, W) shaped uint8 values.
 DataIter = Iterator[tuple[np.ndarray, np.ndarray]]
+
+DEFAULT_PREFETCH_DEPTH = 2
+
+
+def prefetch(
+    data_iter: DataIter, depth: int = DEFAULT_PREFETCH_DEPTH
+) -> DataIter:
+    """
+    Yield from `data_iter`, loading up to `depth` datapoint sets ahead.
+    """
+
+    if depth < 1:
+        raise ValueError(f"{depth=} must be at least 1.")
+
+    loaded: queue.Queue = queue.Queue(maxsize=depth)
+    stop_event = threading.Event()
+    done_indicator = object()
+
+    def load() -> None:
+        try:
+            for batch in data_iter:
+                while not stop_event.is_set():
+                    try:
+                        loaded.put(batch, timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
+
+                if stop_event.is_set():
+                    return
+        except Exception as exc:  # noqa: BLE001
+            loaded.put(exc)
+        finally:
+            if not stop_event.is_set():
+                loaded.put(done_indicator)
+
+    thread = threading.Thread(target=load, daemon=True, name="data-prefetch")
+    thread.start()
+
+    try:
+        while True:
+            batch = loaded.get()
+
+            if batch is done_indicator:
+                return
+            if isinstance(batch, Exception):
+                raise batch
+
+            yield batch
+    finally:
+        stop_event.set()
 
 
 class DataBase(ABC):
-    """
-    Base class for sources of semantic segmentation datapoints.
-    """
-
     def __init__(self):
         pass
 
     @abstractmethod
-    def get_dataset(self, batch_size: int) -> Iterator[tuple[np.ndarray, np.ndarray]]:
-        """
-        Return an iterator over the dataset, in `batch_size`-sized batches.
-
-        Yields
-        ------
-            image_batch: (B, H, W, 3) uint8 values.
-            mask_batch: (B, H, W) uint8 values.
-        """
-
+    def get_dataset(self, batch_size: int) -> DataIter:
         raise NotImplementedError
 
 
 class CarvanaData(DataBase):
     """
-    Class to support accessing Carvana semantic segmentation datapoints.
+    Class to support accessing Carvana semantic segmentation dataset.
     """
 
     ORIGINAL_HEIGHT = 1280
@@ -59,7 +101,7 @@ class CarvanaData(DataBase):
         car_id_to_view_ids: dict[str, list[str]],
     ) -> list[tuple[str, str]]:
         """
-        Flatten (car_id --> [view_id]) to [(car_id, view_id)].
+        Flatten a (car_id --> [view_id]) map to a [(car_id, view_id)] list.
         """
 
         return [
@@ -80,7 +122,7 @@ class CarvanaData(DataBase):
         return os.path.join(self.mask_dir, f"{car_id}_{view_id}_mask.gif")
 
     def __init__(
-        self, data_dir: str, holdout_frac: float = 0.2, seed: int = DEFAULT_SEED
+        self, data_dir: str, val_frac: float = 0.2, seed: int = DEFAULT_SEED
     ):
         super().__init__()
 
@@ -95,11 +137,11 @@ class CarvanaData(DataBase):
             car_id, view_id = stem.split("_")
             self.car_id_to_view_ids.setdefault(car_id, []).append(view_id)
 
-        if not 0 <= holdout_frac <= 1:
-            raise ValueError(f"{holdout_frac=} must be in [0, 1].")
+        if not 0 <= val_frac <= 1:
+            raise ValueError(f"{val_frac=} must be in [0, 1].")
 
         car_ids_by_hash = sorted(self.car_id_to_view_ids, key=self._hash_car_id)
-        val_car_count = round(holdout_frac * len(car_ids_by_hash))
+        val_car_count = round(val_frac * len(car_ids_by_hash))
         val_car_ids = set(car_ids_by_hash[:val_car_count])
 
         self.train_car_id_to_view_ids: dict[str, list[str]] = {
@@ -116,6 +158,7 @@ class CarvanaData(DataBase):
         self.all_car_view_ids = self._flatten_car_id_to_view_ids(
             self.car_id_to_view_ids
         )
+        assert self.all_car_view_ids, "No data found"
         self.train_car_view_ids = self._flatten_car_id_to_view_ids(
             self.train_car_id_to_view_ids
         )
@@ -123,43 +166,38 @@ class CarvanaData(DataBase):
             self.val_car_id_to_view_ids
         )
 
-        assert self.all_car_view_ids
-
         missing_masks = [
             (car_id, view_id)
             for car_id, view_id in self.all_car_view_ids
             if not os.path.exists(self._get_mask_path(car_id, view_id))
         ]
-        assert not missing_masks, f"Images without masks: {missing_masks[:5]}"
+        assert not missing_masks, "Found images without masks"
 
-        rng_seed, train_rng_seed, val_rng_seed = np.random.SeedSequence(seed).spawn(3)
+        rng_seed, train_rng_seed, val_rng_seed = np.random.SeedSequence(
+            seed
+        ).spawn(3)
         self.rng = np.random.default_rng(rng_seed)
         self.train_rng = np.random.default_rng(train_rng_seed)
         self.val_rng = np.random.default_rng(val_rng_seed)
 
+        # fmt: off
         logger.info(
-            f"Loaded Carvana dataset at ({self.image_dir!r}, {self.mask_dir!r}).\n"
-            f"There are {len(self.all_car_view_ids):,} datapoints "
-            f"({len(self.train_car_view_ids):,} train, "
-            f"{len(self.val_car_view_ids):,} val).\n"
-            f"There are {len(self.car_id_to_view_ids):,} cars "
-            f"({len(self.train_car_id_to_view_ids):,} train, "
-            f"{len(self.val_car_id_to_view_ids):,} val)."
+            "\n".join([
+                f"Loaded Carvana dataset from ({self.image_dir!r}, {self.mask_dir!r}).",
+                f"There are {len(self.all_car_view_ids):,} datapoints ({len(self.train_car_view_ids):,} train, {len(self.val_car_view_ids):,} val).",
+                f"There are {len(self.car_id_to_view_ids):,} cars ({len(self.train_car_id_to_view_ids):,} train, {len(self.val_car_id_to_view_ids):,} val)."
+            ])
         )
+        # fmt: on
 
     def _get_dataset(
         self,
         car_view_ids: list[tuple[str, str]],
         batch_size: int,
         rng: np.random.Generator,
-    ) -> Iterator[tuple[np.ndarray, np.ndarray]]:
+    ) -> DataIter:
         """
-        Return an iterator over `car_view_ids` in a random order, drawn from `rng`.
-
-        Yields
-        ------
-            image_batch: (B, H, W, 3) uint8 values.
-            mask_batch: (B, H, W) uint8 values in {0, 1}.
+        Return an iterator over `car_view_ids` in a random order.
         """
 
         order = rng.permutation(len(car_view_ids))
@@ -176,15 +214,24 @@ class CarvanaData(DataBase):
 
             yield np.stack(image_batch), np.stack(mask_batch)
 
-    def get_dataset(self, batch_size: int) -> Iterator[tuple[np.ndarray, np.ndarray]]:
+    def get_dataset(
+        self, batch_size: int
+    ) -> Iterator[tuple[np.ndarray, np.ndarray]]:
+        """Return an iterator over all datapoints."""
         return self._get_dataset(self.all_car_view_ids, batch_size, self.rng)
 
     def get_train_dataset(
         self, batch_size: int
     ) -> Iterator[tuple[np.ndarray, np.ndarray]]:
-        return self._get_dataset(self.train_car_view_ids, batch_size, self.train_rng)
+        """Return an iterator over train datapoints."""
+        return self._get_dataset(
+            self.train_car_view_ids, batch_size, self.train_rng
+        )
 
     def get_val_dataset(
         self, batch_size: int
     ) -> Iterator[tuple[np.ndarray, np.ndarray]]:
-        return self._get_dataset(self.val_car_view_ids, batch_size, self.val_rng)
+        """Return an iterator over val datapoints."""
+        return self._get_dataset(
+            self.val_car_view_ids, batch_size, self.val_rng
+        )

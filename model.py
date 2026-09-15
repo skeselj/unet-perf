@@ -4,29 +4,35 @@ Module to support defining U-Net models in PyTorch.
 
 import torch
 import torch.nn.functional as F
+from profiler import torch_phase
 from torch import nn
 
 from constants import IMAGE_CHANNEL_COUNT
 
-DEFAULT_BASE_CHANNEL_COUNT = 32
-DEFAULT_LEVEL_COUNT = 5
-
 
 def _fan_in(layer: nn.Conv2d | nn.ConvTranspose2d) -> int:
     """
-    Number of inputs contributing to each output pixel of layer.
+    Get number of input pixels contributing to each output pixel of `layer`.
+
+    Regular convolution and de-convolution are supported.
+    In both cases, the output of this function is:
+          (# of pixels in operation receptive field)
+        x (# of input channels)
     """
 
     kernel_height, kernel_width = layer.kernel_size
 
-    if isinstance(layer, nn.ConvTranspose2d):
+    if isinstance(layer, nn.Conv2d):
+        return kernel_height * kernel_width * layer.in_channels
+    elif isinstance(layer, nn.ConvTranspose2d):
         stride_height, stride_width = layer.stride
         return (
-            layer.in_channels
-            * (kernel_height // stride_height)
+            (kernel_height // stride_height)
             * (kernel_width // stride_width)
+            * layer.in_channels
         )
-    return layer.in_channels * kernel_height * kernel_width
+
+    raise NotImplementedError(f"_fan_in does not support {type(layer)}")
 
 
 class _ConvOp(nn.Module):
@@ -98,8 +104,8 @@ class _UpSampleOp(nn.Module):
     """
     The upsample operation used in this module.
 
-    A learned 2x2 deconvolution. Every pixel-sized feature becomes a (2x2)-
-    sized feature.
+    A learned 2x2 deconvolution. Every pixel-sized feature vector becomes a
+    (2x2) bundle of pixel-sized feature vectors.
     """
 
     def __init__(self, input_channel_count: int, output_channel_count: int):
@@ -128,11 +134,14 @@ class _UpSampleOp(nn.Module):
 
 class UNet(nn.Module):
     """
-    Basic U-Net implementation for per-pixel classification.
+    Basic implementation of the U-Net architecture for per-pixel classification.
     """
 
     CONV_KERNEL_SIZE = 3
     CONV_PADDING = CONV_KERNEL_SIZE // 2
+
+    DEFAULT_BASE_CHANNEL_COUNT = 32
+    DEFAULT_LEVEL_COUNT = 5
 
     def __init__(
         self,
@@ -149,22 +158,22 @@ class UNet(nn.Module):
 
         Parameters
         ----------
-            base_height: input images are resized to this before processing.
-            base_width: input images are resized to this before processing.
-            output_channel_count: number of channels in model output, one per
-                class, at most 256.
-            input_channel_count: number of channels in model input.
-            base_channel_count: number of channels in 1st level's output.
+            base_height
+            base_width: input images are resized to (base_height x base_width)
+                before processing. After processing, outputs are resizsed to the
+                resolution of the original input image.
+            output_channel_count: number of channels in the model output, one
+                per class. Must be in [2, 256].
+            input_channel_count: number of channels in the model input.
+            base_channel_count: number of channels in the output of the 1st
+                level of processing.
             level_count: number of levels of processing.
         """
 
         super().__init__()
 
         if not 2 <= output_channel_count <= 256:
-            raise ValueError(
-                f"{output_channel_count=} must be in [2, 256]. "
-                "Class predictions will be returned as np.uint8 values."
-            )
+            raise ValueError(f"{output_channel_count=} must be in [2, 256].")
 
         downsample_factor = 2 ** (level_count - 1)
         if base_height % downsample_factor or base_width % downsample_factor:
@@ -177,7 +186,7 @@ class UNet(nn.Module):
         self.base_width = base_width
         self.level_count = level_count
 
-        # Level to number of channels in its output feature map set.
+        # Level to number of output feature maps.
         level_to_channel_count = {
             "-1": base_channel_count // 2,  # Not a real level.
             **{
@@ -186,7 +195,7 @@ class UNet(nn.Module):
             },
         }
 
-        # Converts input image to feature map set processable by 1st level.
+        # Converts input image to feature maps processable by 1st level.
         self.input_bridge = nn.Conv2d(
             in_channels=input_channel_count,
             out_channels=level_to_channel_count["-1"],
@@ -194,8 +203,7 @@ class UNet(nn.Module):
             padding=self.CONV_PADDING,
         )
 
-        # An encoder-side convolution takes a feature map with C channels, and
-        # returns one with 2*C channels.
+        # On the encoder side, a conv op turns C feature maps into 2*C maps.
         self.level_to_encoder_conv_op = nn.ModuleDict(
             {
                 str(level): _ConvOp(
@@ -207,19 +215,20 @@ class UNet(nn.Module):
                 for level in range(level_count)
             }
         )
-        # Down-sampling happens at the end of most encoder-side levels.
+        # Down-sampling happens after most encoder-side conv ops.
         self.level_to_downsample_op = nn.ModuleDict(
             {str(level): _DownSampleOp() for level in range(level_count - 1)}
             | {str(level_count - 1): None}
         )
 
-        # A decoder-side convolution takes a feature map with C channels, and
-        # returns one with C//2 channels.
+        # On the decoder side, a conv op turns C feature maps into C//2 maps.
         self.level_to_decoder_conv_op = nn.ModuleDict(
             {
                 str(level): (
                     _ConvOp(
-                        input_channel_count=(2 * level_to_channel_count[str(level)]),
+                        input_channel_count=(
+                            2 * level_to_channel_count[str(level)]
+                        ),
                         output_channel_count=level_to_channel_count[str(level)],
                         conv_kernel_size=self.CONV_KERNEL_SIZE,
                         conv_padding=self.CONV_PADDING,
@@ -229,12 +238,14 @@ class UNet(nn.Module):
             }
             | {str(level_count - 1): None}
         )
-        # Up-sampling happens before most decoder-side levels.
+        # Up-sampling happens before most decoder-side conv ops.
         self.level_to_upsample_op = nn.ModuleDict(
             {
                 str(level): (
                     _UpSampleOp(
-                        input_channel_count=level_to_channel_count[str(level + 1)],
+                        input_channel_count=level_to_channel_count[
+                            str(level + 1)
+                        ],
                         output_channel_count=level_to_channel_count[str(level)],
                     )
                 )
@@ -243,7 +254,7 @@ class UNet(nn.Module):
             | {str(level_count - 1): None}
         )
 
-        # Converts final feature maps into output score images.
+        # Converts final feature maps into output per-class score maps.
         self.output_bridge = nn.Conv2d(
             in_channels=level_to_channel_count["0"],
             out_channels=output_channel_count,
@@ -259,7 +270,9 @@ class UNet(nn.Module):
         """
 
         fan_in = _fan_in(self.input_bridge)
-        nn.init.normal_(self.input_bridge.weight, mean=0.0, std=(1 / fan_in) ** 0.5)
+        nn.init.normal_(
+            self.input_bridge.weight, mean=0.0, std=(1 / fan_in) ** 0.5
+        )
         nn.init.zeros_(self.input_bridge.bias)
 
         fan_in = _fan_in(self.output_bridge)
@@ -276,57 +289,67 @@ class UNet(nn.Module):
             input=x,
             size=(height, width),
             mode="bilinear",
-            antialias=True,  # Consider the whole receptive field.
+            antialias=True,  # Consider receptive field, not just nearest 2x2.
         )
 
-    def _forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _normalized_forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Run the forward pass on x, a (B, C, base_H, base_W).
+        Run the forward pass on a (B, C, base_H, base_W) tensor.
         """
 
-        x = self.input_bridge(x)
+        with torch_phase("input_bridge"):
+            x = self.input_bridge(x)
 
         # Encoder-side, from high level to low.
         level_to_skip = {}
         for level in range(self.level_count):
-            x = self.level_to_encoder_conv_op[str(level)](x)
-            level_to_skip[str(level)] = x
+            with torch_phase(f"encoder_{level}"):
+                x = self.level_to_encoder_conv_op[str(level)](x)
+                level_to_skip[str(level)] = x
 
-            downsample_op = self.level_to_downsample_op[str(level)]
-            if downsample_op is not None:
-                x = downsample_op(x)
+                downsample_op = self.level_to_downsample_op[str(level)]
+                if downsample_op is not None:
+                    x = downsample_op(x)
 
         # Decoder-side, from low level to high.
         for level in reversed(range(self.level_count)):
-            upsample_op = self.level_to_upsample_op[str(level)]
-            if upsample_op is not None:
-                x = upsample_op(x)
+            with torch_phase(f"decoder_{level}"):
+                upsample_op = self.level_to_upsample_op[str(level)]
+                if upsample_op is not None:
+                    x = upsample_op(x)
 
-            decoder_conv_op = self.level_to_decoder_conv_op[str(level)]
-            if decoder_conv_op is not None:
-                x = decoder_conv_op(torch.cat([x, level_to_skip[str(level)]], dim=1))
+                decoder_conv_op = self.level_to_decoder_conv_op[str(level)]
+                if decoder_conv_op is not None:
+                    x = decoder_conv_op(
+                        torch.cat([x, level_to_skip[str(level)]], dim=1)
+                    )
 
-        return self.output_bridge(x)
+        with torch_phase("output_bridge"):
+            return self.output_bridge(x)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Run the forward pass on x, a (B, C, H, W) tensor of any H and W.
+        Run the forward pass on a (B, C, H, W), of any H & W.
 
-        Returns a (B, C_out, H, W) tensor of scores.
+        Returns a (B, C_out, H, W) tensor of per-class scores.
         """
 
         original_height, original_width = x.shape[-2:]
 
-        x = self._resize(x, self.base_height, self.base_width)
-        x = self._forward(x)
-        return self._resize(x, original_height, original_width)
+        with torch_phase("resize_in"):
+            x = self._resize(x, self.base_height, self.base_width)
+
+        x = self._normalized_forward(x)
+
+        with torch_phase("resize_out"):
+            return self._resize(x, original_height, original_width)
 
     @torch.inference_mode()
     def predict(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Predict class labels for x, a (B, C, H, W) tensor of any H and W.
+        Predict class labels fora (B, C, H, W) tensor.
 
-        Returns a (B, 1, H, W) uint8 tensor of class labels.
+        Returns a (B, 1, H, W) tensor of class labels.
         """
 
         return self(x).argmax(dim=-3, keepdim=True).to(torch.uint8)

@@ -1,5 +1,5 @@
 """
-Module to support training a U-Net model.
+Module to support training U-Net models.
 """
 
 import itertools
@@ -12,12 +12,13 @@ from datetime import datetime
 import numpy as np
 import torch
 import torch.nn.functional as F
+from profiler import profiler, torch_profile
 from torch import nn
 from torch.utils.tensorboard import SummaryWriter
 
 from constants import DEFAULT_SEED, MAX_PIXEL_INT_VALUE
-from data import CarvanaData, DataIter
-from model import DEFAULT_BASE_CHANNEL_COUNT, DEFAULT_LEVEL_COUNT, UNet
+from data import CarvanaData, DataIter, prefetch
+from model import UNet
 
 standard_logger = logging.getLogger(__name__)
 
@@ -29,16 +30,18 @@ DEFAULT_LOG_IMAGE_DOWNSCALE = 4
 
 class Logger:
     """
-    Class to support logging training-related state.
+    Class to support logging training state.
     """
 
     def __init__(self, log_dir: str | None):
         self.writer = SummaryWriter(log_dir) if log_dir is not None else None
 
     @staticmethod
-    def _shrink(x: torch.Tensor, height: int, width: int, mode: str) -> torch.Tensor:
+    def _shrink(
+        x: torch.Tensor, height: int, width: int, mode: str
+    ) -> torch.Tensor:
         """
-        Resize (N, C, H, W) `x` to (N, C, height, width).
+        Resize a (N, C, H, W) tensor to (N, C, height, width).
         """
 
         if mode == "nearest":
@@ -58,18 +61,20 @@ class Logger:
         small_labels = Logger._shrink(
             labels[:, None].float(), height, width, mode="nearest"
         )
-        gray = small_labels / (class_count - 1)
-        return gray.expand(-1, 3, -1, -1)
+
+        grayscale = small_labels / (class_count - 1)
+
+        return grayscale.expand(-1, 3, -1, -1)
 
     @staticmethod
     def _logits_to_rgb(
         class_logits: torch.Tensor, height: int, width: int
     ) -> torch.Tensor:
         """
-        Convert (N, H, W) one-class logits to a (N, 3, height, width) heatmap.
+        Convert (N, H, W) single-class logits to a (N, 3, height, width)
+        grayscale image.
 
-        Min-max normalized per datapoint; lowest logit is black, highest logit
-        is white.
+        Lowest logit is black, highest logit is white.
         """
 
         small_class_logits = Logger._shrink(
@@ -78,59 +83,65 @@ class Logger:
 
         low = small_class_logits.amin(dim=(-2, -1), keepdim=True)
         high = small_class_logits.amax(dim=(-2, -1), keepdim=True)
-        small_class_logits = (small_class_logits - low) / (high - low).clamp_min(1e-12)
+        grayscale = (small_class_logits - low) / (high - low).clamp_min(1e-12)
 
-        return small_class_logits.expand(-1, 3, -1, -1)
+        return grayscale.expand(-1, 3, -1, -1)
 
     def log_train_metrics(
         self,
-        loss: float,
-        learning_rate: float,
         datapoints_seen: int,
         total_datapoint_count: int,
         datapoints_per_second: float,
+        loss: float,
+        learning_rate: float,
     ) -> None:
         """
         Log core training metrics.
         """
 
+        # fmt: off
         standard_logger.info(
-            "  ".join(
+            "\n".join(
                 [
-                    f"train loss: {loss:.4f}",
-                    f"learning rate: {learning_rate:.2e}",
-                    f"datapoints: {datapoints_seen:,}/{total_datapoint_count:,}",
-                    f"datapoints/s: {datapoints_per_second:.1f}",
+                    "train logs:",
+                    f"\tdatapoints seen: {datapoints_seen:,}/{total_datapoint_count:,}",
+                    f"\tdatapoints per second: {datapoints_per_second:.1f}",
+                    f"\tloss: {loss:.4f}",
+                    f"\tlearning rate: {learning_rate:.2e}",
                 ]
             )
         )
+        # fmt: on
 
         if self.writer is not None:
             for name, value in [
+                ("train/datapoints_per_second", datapoints_per_second),
                 ("train/loss", loss),
                 ("train/learning_rate", learning_rate),
-                ("train/datapoints_per_second", datapoints_per_second),
             ]:
                 self.writer.add_scalar(name, value, datapoints_seen)
 
     def log_val_metrics(
         self,
-        loss: float,
         datapoints_seen: int,
         total_datapoint_count: int,
+        loss: float,
     ) -> None:
         """
         Log core validation metrics.
         """
 
+        # fmt: off
         standard_logger.info(
-            "  ".join(
+            "\n".join(
                 [
-                    f"val loss: {loss:.4f}",
-                    f"datapoints: {datapoints_seen:,}/{total_datapoint_count:,}",
+                    "val logs:",
+                    f"\t(train) datapoints seen: {datapoints_seen:,}/{total_datapoint_count:,}",
+                    f"\tloss: {loss:.4f}",
                 ]
             )
         )
+        # fmt: on
 
         if self.writer is not None:
             self.writer.add_scalar("val/loss", loss, datapoints_seen)
@@ -139,23 +150,23 @@ class Logger:
     def log_images(
         self,
         log_base_name: str,
+        datapoints_seen: int,
         images: torch.Tensor,
         masks: torch.Tensor,
         logits: torch.Tensor,
-        datapoints_seen: int,
-        images_to_log: int,
+        num_images_to_log: int,
         image_downscale: int = DEFAULT_LOG_IMAGE_DOWNSCALE,
     ) -> None:
         """
         Log images, true & predicted classes, and logits.
         """
 
-        if self.writer is None or images_to_log <= 0:
+        if self.writer is None or num_images_to_log <= 0:
             return
 
-        images = images[:images_to_log]
-        masks = masks[:images_to_log]
-        logits = logits[:images_to_log].float()
+        images = images[:num_images_to_log]
+        masks = masks[:num_images_to_log]
+        logits = logits[:num_images_to_log].float()
 
         predictions = logits.argmax(dim=1)
 
@@ -163,7 +174,7 @@ class Logger:
         height = images.shape[-2] // image_downscale
         width = images.shape[-1] // image_downscale
 
-        # Part 1: images.
+        # Part 1: plain images.
         # Each element of `panels` has shape (N, 3, height, width).
         panels = [
             self._shrink(images, height, width, mode="bilinear").clamp(0, 1),
@@ -178,7 +189,9 @@ class Logger:
         rows = torch.cat(panels, dim=-1)
         # `grid` has shape (3, N * height, panel_count * width).
         grid = torch.cat(list(rows), dim=-2)
-        self.writer.add_image(f"{log_base_name}/samples", grid.cpu(), datapoints_seen)
+        self.writer.add_image(
+            f"{log_base_name}/samples", grid.cpu(), datapoints_seen
+        )
 
         # Part 2: histograms.
         small_logits = self._shrink(logits, height, width, mode="bilinear")
@@ -196,7 +209,7 @@ class Logger:
 
 class Trainer:
     """
-    Class to support making training updates to a model w.r.t. some data.
+    Class to support training a model w.r.t. a dataset.
     """
 
     def __init__(
@@ -221,19 +234,27 @@ class Trainer:
             return
 
         remaining = datapoint_count
+        iterator = prefetch(data_iter)
 
-        for image_batch, mask_batch in data_iter:
+        while True:
+            with profiler.phase("load raw data"):
+                batch = next(iterator, None)
+
+            if batch is None:
+                break
+
+            image_batch, mask_batch = batch
             image_batch = image_batch[:remaining]
             mask_batch = mask_batch[:remaining]
+
             remaining -= len(image_batch)
             yield image_batch, mask_batch
-
             if remaining == 0:
                 return
 
         raise ValueError(
-            f"Data ran out after {datapoint_count - remaining:,} of "
-            f"{datapoint_count:,} datapoints."
+            f"Data ran out after {(datapoint_count - remaining):,} datapoints. "
+            f"Requested {datapoint_count:,}."
         )
 
     def _iterate_train_data(self, datapoint_count: int) -> DataIter:
@@ -247,18 +268,16 @@ class Trainer:
         image_batch: np.ndarray, mask_batch: np.ndarray, device: torch.device
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Convert numpy batch to model-ready tensors on device.
-
-        int images                  float images
-        uint8 (B, H, W, 3)      ->  float (B, 3, H, W) in [0, 1].
-
-        int masks                   int labels
-        uint8 (B, H, W)         ->  int64 (B, H, W)
+        Convert numpy batches to model-ready tensors on device.
         """
 
+        # int images                  float images
+        # uint8 (B, H, W, 3)      ->  float (B, 3, H, W) in [0, 1].
         images = torch.from_numpy(image_batch).to(device)
         images = images.permute(0, 3, 1, 2).float() / MAX_PIXEL_INT_VALUE
 
+        # int masks                   int labels
+        # uint8 (B, H, W)         ->  int64 (B, H, W)
         masks = torch.from_numpy(mask_batch).to(device).long()
 
         return images, masks
@@ -275,13 +294,9 @@ class Trainer:
         Evaluate `model` on a train batch, and update it with `optimizer`.
         """
 
-        # images: (B, 3, H, W) floats in [0, 1].
-        # masks: (B, H, W) labels.
-        # logits: (B, N_{classes}, H, W) class scores.
         images, masks = self._to_tensors(image_batch, mask_batch, device)
         logits = model(images)
-
-        loss = F.cross_entropy(logits, masks)  # Averaged.
+        loss = F.cross_entropy(logits, masks)
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -298,13 +313,12 @@ class Trainer:
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Evaluate `model` on a val batch, without updating it.
+        Evaluate `model` on a val batch; do not update the model.
         """
 
         images, masks = self._to_tensors(image_batch, mask_batch, device)
         logits = model(images)
-
-        loss = F.cross_entropy(logits, masks)  # Averaged.
+        loss = F.cross_entropy(logits, masks)
 
         return images, masks, logits, loss
 
@@ -318,6 +332,12 @@ class Trainer:
         if self.log_dir is None:
             return
 
+        with profiler.phase("save checkpoint"):
+            self._save_checkpoint_to_log_dir(model, optimizer)
+
+    def _save_checkpoint_to_log_dir(
+        self, model: nn.Module, optimizer: torch.optim.Optimizer
+    ) -> None:
         os.makedirs(self.log_dir, exist_ok=True)
         path = os.path.join(self.log_dir, "checkpoint.pt")
 
@@ -338,8 +358,8 @@ class Trainer:
         self,
         model: nn.Module,
         datapoint_count: int,
-        log_datapoints_seen_count: int,
-        log_total_datapoints_count: int,
+        log_train_datapoints_seen: int,
+        log_train_total_datapoint_count: int,
         log_image_count: int = DEFAULT_LOG_IMAGE_COUNT,
     ) -> float | None:
         """
@@ -347,7 +367,6 @@ class Trainer:
         """
 
         device = next(model.parameters()).device
-
         was_training = model.training
         model.eval()
 
@@ -355,41 +374,46 @@ class Trainer:
         loss_sum = torch.zeros((), device=device)
 
         try:
-            for image_batch, mask_batch in self._iterate_val_data(datapoint_count):
+            for image_batch, mask_batch in self._iterate_val_data(
+                datapoint_count
+            ):
                 is_logging_step = datapoints_seen == 0
 
                 # Standard step.
-                images, masks, logits, loss = self._infer_on_val_batch(
-                    model, image_batch, mask_batch, device
-                )
+                with profiler.phase("infer on val batch", on_gpu=True):
+                    images, masks, logits, loss = self._infer_on_val_batch(
+                        model, image_batch, mask_batch, device
+                    )
 
-                loss_sum += loss * len(images)
                 datapoints_seen += len(images)
+                loss_sum += loss * len(images)
 
                 if not is_logging_step:
                     continue
 
                 # Logging step.
-                self.logger.log_images(
-                    log_base_name="val",
-                    images=images,
-                    masks=masks,
-                    logits=logits,
-                    datapoints_seen=log_datapoints_seen_count,
-                    images_to_log=log_image_count,
-                )
+                with profiler.phase("log for val batch"):
+                    self.logger.log_images(
+                        log_base_name="val",
+                        datapoints_seen=log_train_datapoints_seen,
+                        images=images,
+                        masks=masks,
+                        logits=logits,
+                        num_images_to_log=log_image_count,
+                    )
         finally:
             model.train(was_training)
 
         if datapoints_seen == 0:
             return None
 
-        mean_loss = (loss_sum / datapoints_seen).item()
-        self.logger.log_val_metrics(
-            loss=mean_loss,
-            datapoints_seen=log_datapoints_seen_count,
-            total_datapoint_count=log_total_datapoints_count,
-        )
+        with profiler.phase("log for val batch"):
+            mean_loss = (loss_sum / datapoints_seen).item()
+            self.logger.log_val_metrics(
+                datapoints_seen=log_train_datapoints_seen,
+                total_datapoint_count=log_train_total_datapoint_count,
+                loss=mean_loss,
+            )
         return mean_loss
 
     def train(
@@ -416,65 +440,76 @@ class Trainer:
         datapoint_index_for_next_log = 0
 
         try:
-            for image_batch, mask_batch in self._iterate_train_data(
-                train_datapoint_count
-            ):
-                # Standard step.
-                images, masks, logits, loss = self._infer_on_train_batch(
-                    model, image_batch, mask_batch, optimizer, device
-                )
-
-                datapoints_seen += len(images)
-                loss_sum_since_last_log += loss * len(images)
-
-                if not (
-                    datapoints_seen > datapoint_index_for_next_log
-                    or datapoints_seen == train_datapoint_count
+            with torch_profile() as end_torch_profile_step:
+                for image_batch, mask_batch in self._iterate_train_data(
+                    train_datapoint_count
                 ):
-                    continue
+                    # Standard step.
+                    with profiler.phase("infer on train batch", on_gpu=True):
+                        images, masks, logits, loss = (
+                            self._infer_on_train_batch(
+                                model,
+                                image_batch,
+                                mask_batch,
+                                optimizer,
+                                device,
+                            )
+                        )
 
-                # Logging & validation step.
-                datapoints_since_last_log = (
-                    datapoints_seen - datapoints_seen_at_last_log
-                )
-                mean_loss_since_last_log = (
-                    loss_sum_since_last_log / datapoints_since_last_log
-                ).item()
-                time_since_last_log = time.perf_counter() - time_of_last_log
+                    end_torch_profile_step()
 
-                self.logger.log_train_metrics(
-                    loss=mean_loss_since_last_log,
-                    learning_rate=optimizer.param_groups[0]["lr"],
-                    datapoints_seen=datapoints_seen,
-                    total_datapoint_count=train_datapoint_count,
-                    datapoints_per_second=(
-                        datapoints_since_last_log / time_since_last_log
-                    ),
-                )
-                self.logger.log_images(
-                    log_base_name="train",
-                    images=images,
-                    masks=masks,
-                    logits=logits,
-                    datapoints_seen=datapoints_seen,
-                    images_to_log=log_image_count,
-                )
+                    datapoints_seen += len(images)
+                    loss_sum_since_last_log += loss * len(images)
 
-                self.validate(
-                    model=model,
-                    datapoint_count=val_datapoint_count,
-                    log_datapoints_seen_count=datapoints_seen,
-                    log_total_datapoints_count=train_datapoint_count,
-                    log_image_count=log_image_count,
-                )
+                    if not (
+                        datapoints_seen > datapoint_index_for_next_log
+                        or datapoints_seen == train_datapoint_count
+                    ):
+                        continue
 
-                loss_sum_since_last_log.zero_()
-                time_of_last_log = time.perf_counter()
-                datapoints_seen_at_last_log = datapoints_seen
-                datapoint_index_for_next_log = (
-                    math.ceil(datapoints_seen / log_every_n_datapoints)
-                    * log_every_n_datapoints
-                )
+                    # Logging & validation step.
+                    datapoints_since_last_log = (
+                        datapoints_seen - datapoints_seen_at_last_log
+                    )
+                    mean_loss_since_last_log = (
+                        loss_sum_since_last_log / datapoints_since_last_log
+                    ).item()
+                    time_since_last_log = time.perf_counter() - time_of_last_log
+
+                    with profiler.phase("log for train batch"):
+                        self.logger.log_train_metrics(
+                            datapoints_seen=datapoints_seen,
+                            total_datapoint_count=train_datapoint_count,
+                            datapoints_per_second=(
+                                datapoints_since_last_log / time_since_last_log
+                            ),
+                            loss=mean_loss_since_last_log,
+                            learning_rate=optimizer.param_groups[0]["lr"],
+                        )
+                        self.logger.log_images(
+                            log_base_name="train",
+                            datapoints_seen=datapoints_seen,
+                            images=images,
+                            masks=masks,
+                            logits=logits,
+                            num_images_to_log=log_image_count,
+                        )
+
+                    self.validate(
+                        model=model,
+                        datapoint_count=val_datapoint_count,
+                        log_train_datapoints_seen=datapoints_seen,
+                        log_train_total_datapoint_count=train_datapoint_count,
+                        log_image_count=log_image_count,
+                    )
+
+                    loss_sum_since_last_log.zero_()
+                    time_of_last_log = time.perf_counter()
+                    datapoints_seen_at_last_log = datapoints_seen
+                    datapoint_index_for_next_log = (
+                        math.ceil(datapoints_seen / log_every_n_datapoints)
+                        * log_every_n_datapoints
+                    )
         finally:
             self.logger.close()
             self._save_checkpoint(model, optimizer)
@@ -487,8 +522,8 @@ def train_unet_from_scratch_on_carvana(
     log_every_n_datapoints: int,
     base_height: int = 256,
     base_width: int = 384,
-    base_channel_count: int = DEFAULT_BASE_CHANNEL_COUNT,
-    level_count: int = DEFAULT_LEVEL_COUNT,
+    base_channel_count: int = UNet.DEFAULT_BASE_CHANNEL_COUNT,
+    level_count: int = UNet.DEFAULT_LEVEL_COUNT,
     learning_rate: float = 1e-4,
     data_dir: str = "./data/carvana",
     log_dir: str | None = None,
@@ -503,13 +538,15 @@ def train_unet_from_scratch_on_carvana(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     standard_logger.info(f"device: {device}")
 
-    model = UNet(
-        base_height=base_height,
-        base_width=base_width,
-        output_channel_count=CarvanaData.NUM_CLASSES,
-        base_channel_count=base_channel_count,
-        level_count=level_count,
-    ).to(device)
+    with profiler.phase("define model", on_gpu=True):
+        model = UNet(
+            base_height=base_height,
+            base_width=base_width,
+            output_channel_count=CarvanaData.NUM_CLASSES,
+            base_channel_count=base_channel_count,
+            level_count=level_count,
+            # Batches are (B, H, W, C) before being permuted to (B, C, H, W).
+        ).to(device, memory_format=torch.channels_last)
 
     data = CarvanaData(data_dir=data_dir, seed=seed)
     train_data_iter = itertools.chain.from_iterable(
@@ -526,13 +563,14 @@ def train_unet_from_scratch_on_carvana(
         val_data_iter=val_data_iter,
         log_dir=log_dir,
     )
-    trainer.train(
-        model=model,
-        train_datapoint_count=train_datapoint_count,
-        val_datapoint_count=val_datapoint_count,
-        optimizer=optimizer,
-        log_every_n_datapoints=log_every_n_datapoints,
-    )
+    with profiler.session():
+        trainer.train(
+            model=model,
+            train_datapoint_count=train_datapoint_count,
+            val_datapoint_count=val_datapoint_count,
+            optimizer=optimizer,
+            log_every_n_datapoints=log_every_n_datapoints,
+        )
 
     return model
 
@@ -544,9 +582,11 @@ if __name__ == "__main__":
     )
     start_time = datetime.now().astimezone()
     train_unet_from_scratch_on_carvana(
-        train_datapoint_count=20000,   # About 5 epochs.
-        val_datapoint_count=100,
+        train_datapoint_count=1500,
+        val_datapoint_count=50,
         batch_size=6,
         log_every_n_datapoints=500,
-        log_dir=os.path.join("logs/runs", f"unet_carvana_{start_time:%Y%m%d_%H%M%S}"),
+        log_dir=os.path.join(
+            "logs/runs", f"unet_carvana_{start_time:%Y%m%d_%H%M%S}"
+        ),
     )
