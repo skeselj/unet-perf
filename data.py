@@ -9,20 +9,27 @@ import queue
 import threading
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
+import torch
 from PIL import Image
 
 from constants import DEFAULT_SEED
 
 logger = logging.getLogger(__name__)
 
-# Iterator over datapoint sets: (image_batch, mask_batch).
-#   image_batch: (B, H, W, 3) shaped uint8 values.
-#   mask_batch: (B, H, W) shaped uint8 values.
-DataIter = Iterator[tuple[np.ndarray, np.ndarray]]
+# One datapoint: (image, mask).
+#   image: (H, W, 3) shaped uint8 values.
+#   mask: (H, W) shaped uint8 values.
+Datapoint = tuple[np.ndarray, np.ndarray]
+DataIter = Iterator[Datapoint]
 
-DEFAULT_PREFETCH_DEPTH = 2
+TensorDatapoint = tuple[torch.Tensor, torch.Tensor]
+TensorIter = Iterator[TensorDatapoint]
+
+DEFAULT_PREFETCH_DEPTH = int(os.environ.get("DATA_PREFETCH_DEPTH", "1"))
+DEFAULT_WORKER_COUNT = int(os.environ.get("DATA_WORKER_COUNT", "1"))
 
 
 def prefetch(
@@ -72,6 +79,28 @@ def prefetch(
             yield batch
     finally:
         stop_event.set()
+
+
+def pin(data_iter: DataIter) -> TensorIter:
+    """
+    Yield from `data_iter` as tensors, in page-locked memory if possible.
+
+    Page-locked memory can be read by the GPU's DMA engine directly.
+    """
+
+    is_pinnable = torch.cuda.is_available() and (
+        os.environ.get("PIN_DATA", "0") != "0"
+    )
+
+    for image_batch, mask_batch in data_iter:
+        images = torch.from_numpy(image_batch)
+        masks = torch.from_numpy(mask_batch)
+
+        if is_pinnable:
+            images = images.pin_memory()
+            masks = masks.pin_memory()
+
+        yield images, masks
 
 
 class DataBase(ABC):
@@ -184,54 +213,68 @@ class CarvanaData(DataBase):
         logger.info(
             "\n".join([
                 f"Loaded Carvana dataset from ({self.image_dir!r}, {self.mask_dir!r}).",
-                f"There are {len(self.all_car_view_ids):,} datapoints ({len(self.train_car_view_ids):,} train, {len(self.val_car_view_ids):,} val).",
-                f"There are {len(self.car_id_to_view_ids):,} cars ({len(self.train_car_id_to_view_ids):,} train, {len(self.val_car_id_to_view_ids):,} val)."
+                f"\tThere are {len(self.all_car_view_ids):,} datapoints ({len(self.train_car_view_ids):,} train, {len(self.val_car_view_ids):,} val).",
+                f"\tThere are {len(self.car_id_to_view_ids):,} cars ({len(self.train_car_id_to_view_ids):,} train, {len(self.val_car_id_to_view_ids):,} val)."
             ])
         )
         # fmt: on
+
+    def _load_datapoint(self, car_id: str, view_id: str) -> Datapoint:
+        with Image.open(self._get_image_path(car_id, view_id)) as image:
+            image_array = np.asarray(image.convert("RGB"))
+        with Image.open(self._get_mask_path(car_id, view_id)) as mask:
+            mask_array = (np.asarray(mask) > 0).astype(np.uint8)
+
+        return image_array, mask_array
 
     def _get_dataset(
         self,
         car_view_ids: list[tuple[str, str]],
         batch_size: int,
         rng: np.random.Generator,
+        worker_count: int = DEFAULT_WORKER_COUNT,
     ) -> DataIter:
         """
         Return an iterator over `car_view_ids` in a random order.
         """
 
+        if worker_count < 1:
+            raise ValueError(f"{worker_count=} must be at least 1.")
+
         order = rng.permutation(len(car_view_ids))
 
-        for start in range(0, len(order), batch_size):
-            image_batch, mask_batch = [], []
+        with ThreadPoolExecutor(
+            max_workers=worker_count, thread_name_prefix="data-load"
+        ) as pool:
+            for start in range(0, len(order), batch_size):
+                datapoints = pool.map(
+                    lambda index: self._load_datapoint(*car_view_ids[index]),
+                    order[start : start + batch_size],
+                )
+                image_batch, mask_batch = zip(*datapoints, strict=True)
 
-            for index in order[start : start + batch_size]:
-                car_id, view_id = car_view_ids[index]
-                with Image.open(self._get_image_path(car_id, view_id)) as image:
-                    image_batch.append(np.asarray(image.convert("RGB")))
-                with Image.open(self._get_mask_path(car_id, view_id)) as mask:
-                    mask_batch.append((np.asarray(mask) > 0).astype(np.uint8))
-
-            yield np.stack(image_batch), np.stack(mask_batch)
+                yield np.stack(image_batch), np.stack(mask_batch)
 
     def get_dataset(
-        self, batch_size: int
+        self, batch_size: int, worker_count: int = DEFAULT_WORKER_COUNT
     ) -> Iterator[tuple[np.ndarray, np.ndarray]]:
         """Return an iterator over all datapoints."""
-        return self._get_dataset(self.all_car_view_ids, batch_size, self.rng)
+        return self._get_dataset(
+            self.all_car_view_ids, batch_size, self.rng, worker_count
+        )
 
     def get_train_dataset(
-        self, batch_size: int
+        self, batch_size: int, worker_count: int = DEFAULT_WORKER_COUNT
     ) -> Iterator[tuple[np.ndarray, np.ndarray]]:
         """Return an iterator over train datapoints."""
         return self._get_dataset(
-            self.train_car_view_ids, batch_size, self.train_rng
+            self.train_car_view_ids, batch_size, self.train_rng, worker_count
         )
 
     def get_val_dataset(
-        self, batch_size: int
+        self, batch_size: int, worker_count: int = DEFAULT_WORKER_COUNT
     ) -> Iterator[tuple[np.ndarray, np.ndarray]]:
         """Return an iterator over val datapoints."""
         return self._get_dataset(
-            self.val_car_view_ids, batch_size, self.val_rng
+            self.val_car_view_ids, batch_size, self.val_rng, worker_count
         )

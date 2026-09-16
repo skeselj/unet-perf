@@ -2,12 +2,17 @@
 Module to support defining U-Net models in PyTorch.
 """
 
+import logging
+import os
+
 import torch
 import torch.nn.functional as F
 from profiler import torch_phase
 from torch import nn
 
 from constants import IMAGE_CHANNEL_COUNT
+
+logger = logging.getLogger(__name__)
 
 
 def _fan_in(layer: nn.Conv2d | nn.ConvTranspose2d) -> int:
@@ -100,12 +105,44 @@ class _DownSampleOp(nn.Module):
         return self.op(x)
 
 
-class _UpSampleOp(nn.Module):
+class _UpSampleOp_UpConv(nn.Module):
     """
-    The upsample operation used in this module.
+    The "up-conv" version of the upsample operation.
 
-    A learned 2x2 deconvolution. Every pixel-sized feature vector becomes a
-    (2x2) bundle of pixel-sized feature vectors.
+    This was used in the original U-Net paper.
+    """
+
+    def __init__(self, input_channel_count: int, output_channel_count: int):
+        super().__init__()
+        self.op = nn.Conv2d(
+            in_channels=input_channel_count,
+            out_channels=output_channel_count,
+            kernel_size=2,
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        """
+        Initialize learnable parameters.
+        """
+
+        fan_in = _fan_in(self.op)
+        nn.init.normal_(self.op.weight, mean=0.0, std=(1 / fan_in) ** 0.5)
+        nn.init.zeros_(self.op.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.interpolate(
+            x, scale_factor=2, mode="bilinear", align_corners=False
+        )
+        x = F.pad(x, (0, 1, 0, 1))
+        return self.op(x)
+
+
+class _UpSampleOp_Deconv(nn.Module):
+    """
+    The "deconv" version of the upsample operation.
+
+    This is faster than up-conv, and can accomplish similar a similar function.
     """
 
     def __init__(self, input_channel_count: int, output_channel_count: int):
@@ -116,7 +153,6 @@ class _UpSampleOp(nn.Module):
             kernel_size=2,
             stride=2,
         )
-
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -130,6 +166,13 @@ class _UpSampleOp(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.op(x)
+
+
+_UpSampleOp = (
+    _UpSampleOp_Deconv
+    if (os.environ.get("USE_DECONV_UPSAMPLE", "0") != "0")
+    else _UpSampleOp_UpConv
+)
 
 
 class UNet(nn.Module):
@@ -184,6 +227,9 @@ class UNet(nn.Module):
 
         self.base_height = base_height
         self.base_width = base_width
+        self.output_channel_count = output_channel_count
+        self.input_channel_count = input_channel_count
+        self.base_channel_count = base_channel_count
         self.level_count = level_count
 
         # Level to number of output feature maps.
@@ -264,6 +310,42 @@ class UNet(nn.Module):
 
         self.reset_parameters()
 
+        # fmt: off
+        level_lines = []
+
+        for level in range(level_count):
+            shape = f"({level_to_channel_count[str(level)]:>4}, {base_height // 2**level:>4}, {base_width // 2**level:>4})"
+            has_decoder = self.level_to_decoder_conv_op[str(level)] is not None
+
+            level_lines.append(
+                f"\tlevel {level}: "
+                f"encoder {shape}, "
+                f"decoder {shape if has_decoder else 'none'}"
+            )
+
+        logger.info(
+            "\n".join([
+                f"Defined a U-Net over {level_count} levels, with (C, H, W) shaped feature maps.",
+                *level_lines,
+            ])
+        )
+        # fmt: on
+
+    @property
+    def config(self) -> dict[str, int]:
+        """
+        Get the arguments this model was constructed with.
+        """
+
+        return {
+            "base_height": self.base_height,
+            "base_width": self.base_width,
+            "output_channel_count": self.output_channel_count,
+            "input_channel_count": self.input_channel_count,
+            "base_channel_count": self.base_channel_count,
+            "level_count": self.level_count,
+        }
+
     def reset_parameters(self) -> None:
         """
         Initialize learnable parameters owned directly by this module.
@@ -338,6 +420,8 @@ class UNet(nn.Module):
 
         with torch_phase("resize_in"):
             x = self._resize(x, self.base_height, self.base_width)
+            if os.environ.get("MAKE_DATA_CONTIGUOUS", "0") != "0":
+                x = x.contiguous()
 
         x = self._normalized_forward(x)
 
@@ -353,3 +437,14 @@ class UNet(nn.Module):
         """
 
         return self(x).argmax(dim=-3, keepdim=True).to(torch.uint8)
+
+    def compile(self, *args, **kwargs) -> None:
+        """
+        Compile the fixed-size portion of the forward pass.
+
+        Overrides `nn.Module.compile`, which compiles all of `forward`.
+        """
+
+        self._normalized_forward = torch.compile(
+            self._normalized_forward, *args, **kwargs
+        )

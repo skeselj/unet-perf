@@ -9,7 +9,6 @@ import os
 import time
 from datetime import datetime
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from profiler import profiler, torch_profile
@@ -17,15 +16,17 @@ from torch import nn
 from torch.utils.tensorboard import SummaryWriter
 
 from constants import DEFAULT_SEED, MAX_PIXEL_INT_VALUE
-from data import CarvanaData, DataIter, prefetch
+from data import CarvanaData, DataIter, TensorIter, pin, prefetch
 from model import UNet
 
 standard_logger = logging.getLogger(__name__)
 
 
-DEFAULT_LOG_EVERY_N = 1000
+DEFAULT_LOG_EVERY_N = 500
 DEFAULT_LOG_IMAGE_COUNT = 2
 DEFAULT_LOG_IMAGE_DOWNSCALE = 4
+
+DEFAULT_CHECKPOINT_FILE_NAME = "checkpoint.pt"
 
 
 class Logger:
@@ -225,7 +226,7 @@ class Trainer:
         self.logger = Logger(log_dir=log_dir)
 
     @staticmethod
-    def _iterate_data(data_iter: DataIter, datapoint_count: int) -> DataIter:
+    def _iterate_data(data_iter: DataIter, datapoint_count: int) -> TensorIter:
         """
         Yield batches from `data_iter` until `datapoint_count` datapoints yielded.
         """
@@ -234,7 +235,7 @@ class Trainer:
             return
 
         remaining = datapoint_count
-        iterator = prefetch(data_iter)
+        iterator = prefetch(pin(data_iter))
 
         while True:
             with profiler.phase("load raw data"):
@@ -257,15 +258,17 @@ class Trainer:
             f"Requested {datapoint_count:,}."
         )
 
-    def _iterate_train_data(self, datapoint_count: int) -> DataIter:
+    def _iterate_train_data(self, datapoint_count: int) -> TensorIter:
         return self._iterate_data(self.train_data_iter, datapoint_count)
 
-    def _iterate_val_data(self, datapoint_count: int) -> DataIter:
+    def _iterate_val_data(self, datapoint_count: int) -> TensorIter:
         return self._iterate_data(self.val_data_iter, datapoint_count)
 
     @staticmethod
     def _to_tensors(
-        image_batch: np.ndarray, mask_batch: np.ndarray, device: torch.device
+        image_batch: torch.Tensor,
+        mask_batch: torch.Tensor,
+        device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Convert numpy batches to model-ready tensors on device.
@@ -273,20 +276,20 @@ class Trainer:
 
         # int images                  float images
         # uint8 (B, H, W, 3)      ->  float (B, 3, H, W) in [0, 1].
-        images = torch.from_numpy(image_batch).to(device)
+        images = image_batch.to(device, non_blocking=True)
         images = images.permute(0, 3, 1, 2).float() / MAX_PIXEL_INT_VALUE
 
         # int masks                   int labels
         # uint8 (B, H, W)         ->  int64 (B, H, W)
-        masks = torch.from_numpy(mask_batch).to(device).long()
+        masks = mask_batch.to(device, non_blocking=True).long()
 
         return images, masks
 
     def _infer_on_train_batch(
         self,
         model: nn.Module,
-        image_batch: np.ndarray,
-        mask_batch: np.ndarray,
+        image_batch: torch.Tensor,
+        mask_batch: torch.Tensor,
         optimizer: torch.optim.Optimizer,
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -308,8 +311,8 @@ class Trainer:
     def _infer_on_val_batch(
         self,
         model: nn.Module,
-        image_batch: np.ndarray,
-        mask_batch: np.ndarray,
+        image_batch: torch.Tensor,
+        mask_batch: torch.Tensor,
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -326,7 +329,7 @@ class Trainer:
         self, model: nn.Module, optimizer: torch.optim.Optimizer
     ) -> None:
         """
-        Save model & optimizer state to `self.log_dir`/checkpoint.pt, if set.
+        Save model & optimizer state under `self.log_dir`, if it is set.
         """
 
         if self.log_dir is None:
@@ -339,12 +342,13 @@ class Trainer:
         self, model: nn.Module, optimizer: torch.optim.Optimizer
     ) -> None:
         os.makedirs(self.log_dir, exist_ok=True)
-        path = os.path.join(self.log_dir, "checkpoint.pt")
+        path = os.path.join(self.log_dir, DEFAULT_CHECKPOINT_FILE_NAME)
 
         temporary_path = f"{path}.tmp"
         torch.save(
             {
                 "model": model.state_dict(),
+                "model_config": getattr(model, "config", None),
                 "optimizer": optimizer.state_dict(),
             },
             temporary_path,
@@ -385,8 +389,8 @@ class Trainer:
                         model, image_batch, mask_batch, device
                     )
 
-                datapoints_seen += len(images)
-                loss_sum += loss * len(images)
+                    datapoints_seen += len(images)
+                    loss_sum += loss * len(images)
 
                 if not is_logging_step:
                     continue
@@ -433,7 +437,6 @@ class Trainer:
         model.train()
 
         datapoints_seen = 0
-
         loss_sum_since_last_log = torch.zeros((), device=device)
         time_of_last_log = time.perf_counter()
         datapoints_seen_at_last_log = 0
@@ -456,10 +459,10 @@ class Trainer:
                             )
                         )
 
-                    end_torch_profile_step()
+                        datapoints_seen += len(images)
+                        loss_sum_since_last_log += loss * len(images)
 
-                    datapoints_seen += len(images)
-                    loss_sum_since_last_log += loss * len(images)
+                    end_torch_profile_step()
 
                     if not (
                         datapoints_seen > datapoint_index_for_next_log
@@ -538,16 +541,6 @@ def train_unet_from_scratch_on_carvana(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     standard_logger.info(f"device: {device}")
 
-    with profiler.phase("define model", on_gpu=True):
-        model = UNet(
-            base_height=base_height,
-            base_width=base_width,
-            output_channel_count=CarvanaData.NUM_CLASSES,
-            base_channel_count=base_channel_count,
-            level_count=level_count,
-            # Batches are (B, H, W, C) before being permuted to (B, C, H, W).
-        ).to(device, memory_format=torch.channels_last)
-
     data = CarvanaData(data_dir=data_dir, seed=seed)
     train_data_iter = itertools.chain.from_iterable(
         data.get_train_dataset(batch_size=batch_size) for _ in itertools.count()
@@ -556,14 +549,26 @@ def train_unet_from_scratch_on_carvana(
         data.get_val_dataset(batch_size=batch_size) for _ in itertools.count()
     )
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-
-    trainer = Trainer(
-        train_data_iter=train_data_iter,
-        val_data_iter=val_data_iter,
-        log_dir=log_dir,
-    )
     with profiler.session():
+        with profiler.phase("define model", on_gpu=True):
+            model = UNet(
+                base_height=base_height,
+                base_width=base_width,
+                output_channel_count=CarvanaData.NUM_CLASSES,
+                base_channel_count=base_channel_count,
+                level_count=level_count,
+            ).to(device)
+
+            if os.environ.get("COMPILE_MODEL", "0") != "0":
+                model.compile()
+
+            optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+
+        trainer = Trainer(
+            train_data_iter=train_data_iter,
+            val_data_iter=val_data_iter,
+            log_dir=log_dir,
+        )
         trainer.train(
             model=model,
             train_datapoint_count=train_datapoint_count,
@@ -582,7 +587,7 @@ if __name__ == "__main__":
     )
     start_time = datetime.now().astimezone()
     train_unet_from_scratch_on_carvana(
-        train_datapoint_count=1500,
+        train_datapoint_count=3000,  # About 3 epochs.
         val_datapoint_count=50,
         batch_size=6,
         log_every_n_datapoints=500,
