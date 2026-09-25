@@ -420,6 +420,40 @@ class Trainer:
             )
         return mean_loss
 
+    def warm_up(
+        self,
+        model: nn.Module,
+        batch_size: int,
+        height: int = CarvanaData.ORIGINAL_HEIGHT,
+        width: int = CarvanaData.ORIGINAL_WIDTH,
+    ) -> None:
+        """
+        Run a train & a val step on a synthetic batch, without updating `model`.
+        """
+
+        device = next(model.parameters()).device
+        was_training = model.training
+
+        image_batch = torch.zeros(
+            (batch_size, height, width, 3), dtype=torch.uint8
+        )
+        mask_batch = torch.zeros((batch_size, height, width), dtype=torch.uint8)
+        images, masks = self._to_tensors(image_batch, mask_batch, device)
+
+        try:
+            # Train mode, with grad: forward & backward, but no optimizer step.
+            model.train()
+            loss = F.cross_entropy(model(images), masks)
+            loss.backward()
+            model.zero_grad(set_to_none=True)
+
+            # Eval mode, without grad: a separate compiled graph.
+            model.eval()
+            with torch.no_grad():
+                F.cross_entropy(model(images), masks)
+        finally:
+            model.train(was_training)
+
     def train(
         self,
         model: nn.Module,
@@ -569,6 +603,10 @@ def train_unet_from_scratch_on_carvana(
             val_data_iter=val_data_iter,
             log_dir=log_dir,
         )
+
+        with profiler.phase("warm up", on_gpu=True):
+            trainer.warm_up(model=model, batch_size=batch_size)
+
         trainer.train(
             model=model,
             train_datapoint_count=train_datapoint_count,
@@ -588,7 +626,7 @@ if __name__ == "__main__":
     start_time = datetime.now().astimezone()
     train_unet_from_scratch_on_carvana(
         train_datapoint_count=3000,  # About 3 epochs.
-        val_datapoint_count=50,
+        val_datapoint_count=60,
         batch_size=6,
         log_every_n_datapoints=500,
         log_dir=os.path.join(

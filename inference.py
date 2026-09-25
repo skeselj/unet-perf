@@ -124,6 +124,32 @@ class Evaluator:
         return images, masks
 
     @torch.no_grad()
+    def warm_up(
+        self,
+        model: UNet,
+        batch_size: int,
+        height: int = CarvanaData.ORIGINAL_HEIGHT,
+        width: int = CarvanaData.ORIGINAL_WIDTH,
+    ) -> None:
+        """
+        Run an inference step on a synthetic batch, as `infer` would.
+        """
+
+        parameter = next(model.parameters())
+        device = parameter.device
+        dtype = parameter.dtype
+
+        image_batch = torch.zeros(
+            (batch_size, height, width, 3), dtype=torch.uint8
+        )
+        mask_batch = torch.zeros((batch_size, height, width), dtype=torch.uint8)
+        images, masks = self._to_tensors(image_batch, mask_batch, device, dtype)
+
+        logits = model(images)
+        F.cross_entropy(logits.float(), masks)
+        logits.argmax(dim=1)
+
+    @torch.no_grad()
     def infer(
         self,
         model: UNet,
@@ -231,6 +257,10 @@ def infer_with_unet_on_carvana(
                 model.compile()
 
         evaluator = Evaluator(data_iter=data_iter)
+
+        with profiler.phase("warm up", on_gpu=True):
+            evaluator.warm_up(model=model, batch_size=batch_size)
+
         evaluator.infer(
             model=model,
             datapoint_count=datapoint_count,

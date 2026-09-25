@@ -28,7 +28,7 @@ DataIter = Iterator[Datapoint]
 TensorDatapoint = tuple[torch.Tensor, torch.Tensor]
 TensorIter = Iterator[TensorDatapoint]
 
-DEFAULT_PREFETCH_DEPTH = int(os.environ.get("DATA_PREFETCH_DEPTH", "1"))
+DEFAULT_PREFETCH_DEPTH = int(os.environ.get("DATA_PREFETCH_DEPTH", "0"))
 DEFAULT_WORKER_COUNT = int(os.environ.get("DATA_WORKER_COUNT", "1"))
 
 
@@ -39,8 +39,12 @@ def prefetch(
     Yield from `data_iter`, loading up to `depth` datapoint sets ahead.
     """
 
-    if depth < 1:
-        raise ValueError(f"{depth=} must be at least 1.")
+    if depth < 0:
+        raise ValueError(f"{depth=} must be at least 0.")
+
+    if depth == 0:
+        yield from data_iter
+        return
 
     loaded: queue.Queue = queue.Queue(maxsize=depth)
     stop_event = threading.Event()
